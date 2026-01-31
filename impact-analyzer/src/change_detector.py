@@ -7,6 +7,7 @@ import subprocess
 import os
 import re
 import json
+import yaml
 from pathlib import Path
 from typing import List, Dict, Set, Optional
 
@@ -22,6 +23,7 @@ class ChangeDetector:
             repo_path: Path to git repository
         """
         self.repo_path = Path(repo_path).resolve()
+        self._helm_charts_cache = None
         
     def get_changed_files(
         self, 
@@ -227,3 +229,122 @@ class ChangeDetector:
                     services.add(parts[2])
         
         return services
+    
+    def detect_helm_changes(self, changed_files: List[str]) -> List[Dict]:
+        """
+        Detect changes to Helm charts.
+        
+        Args:
+            changed_files: List of changed file paths
+            
+        Returns:
+            List of changed Helm chart information
+        """
+        helm_changes = []
+        helm_charts = self._find_helm_charts()
+        
+        for filepath in changed_files:
+            file_path = Path(filepath)
+            
+            # Check if file is part of a Helm chart
+            for chart_path in helm_charts:
+                try:
+                    # Check if file is within chart directory
+                    relative = file_path.relative_to(chart_path)
+                    
+                    # Determine type of change
+                    change_type = self._categorize_helm_change(relative)
+                    
+                    if change_type:
+                        chart_name = self._get_chart_name(chart_path)
+                        helm_changes.append({
+                            'chart_path': str(chart_path),
+                            'chart_name': chart_name,
+                            'changed_file': filepath,
+                            'relative_path': str(relative),
+                            'change_type': change_type,
+                            'severity': self._assess_helm_change_severity(change_type, relative)
+                        })
+                        break
+                except ValueError:
+                    # File is not relative to this chart
+                    continue
+        
+        return helm_changes
+    
+    def _find_helm_charts(self) -> List[Path]:
+        """Find all Helm charts in the repository."""
+        if self._helm_charts_cache is not None:
+            return self._helm_charts_cache
+        
+        charts = []
+        
+        # Walk through directories looking for Chart.yaml
+        for root, dirs, files in os.walk(self.repo_path):
+            # Skip hidden directories and common ignore patterns
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', 'venv', '__pycache__', '.git']]
+            
+            # Check if this directory has Chart.yaml
+            if 'Chart.yaml' in files:
+                charts.append(Path(root))
+        
+        self._helm_charts_cache = charts
+        return charts
+    
+    def _get_chart_name(self, chart_path: Path) -> str:
+        """Get chart name from Chart.yaml."""
+        chart_yaml = chart_path / 'Chart.yaml'
+        
+        if chart_yaml.exists():
+            try:
+                with open(chart_yaml, 'r') as f:
+                    data = yaml.safe_load(f)
+                    return data.get('name', chart_path.name)
+            except Exception:
+                pass
+        
+        return chart_path.name
+    
+    def _categorize_helm_change(self, relative_path: Path) -> Optional[str]:
+        """Categorize the type of Helm change."""
+        path_str = str(relative_path)
+        name = relative_path.name
+        
+        if name == 'Chart.yaml':
+            return 'CHART_METADATA'
+        elif name == 'values.yaml' or name.endswith('.values.yaml'):
+            return 'VALUES'
+        elif path_str.startswith('templates/'):
+            # Categorize by resource type
+            if 'deployment' in name.lower():
+                return 'DEPLOYMENT_TEMPLATE'
+            elif 'service' in name.lower():
+                return 'SERVICE_TEMPLATE'
+            elif 'ingress' in name.lower():
+                return 'INGRESS_TEMPLATE'
+            elif 'configmap' in name.lower():
+                return 'CONFIGMAP_TEMPLATE'
+            elif 'secret' in name.lower():
+                return 'SECRET_TEMPLATE'
+            else:
+                return 'TEMPLATE'
+        elif path_str.startswith('charts/'):
+            return 'DEPENDENCY'
+        
+        return None
+    
+    def _assess_helm_change_severity(self, change_type: str, relative_path: Path) -> str:
+        """Assess severity of Helm change."""
+        severity_map = {
+            'CHART_METADATA': 'MEDIUM',
+            'VALUES': 'HIGH',
+            'DEPLOYMENT_TEMPLATE': 'CRITICAL',
+            'SERVICE_TEMPLATE': 'HIGH',
+            'INGRESS_TEMPLATE': 'HIGH',
+            'CONFIGMAP_TEMPLATE': 'MEDIUM',
+            'SECRET_TEMPLATE': 'CRITICAL',
+            'TEMPLATE': 'MEDIUM',
+            'DEPENDENCY': 'HIGH',
+        }
+        
+        return severity_map.get(change_type, 'MEDIUM')

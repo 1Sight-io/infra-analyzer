@@ -318,3 +318,235 @@ class GraphAnalyzer:
                 recommendations.append(record['recommendation'])
             
             return {'recommendations': recommendations}
+    
+    def analyze_helm_chart_impact(self, chart_names: List[str]) -> Dict:
+        """
+        Analyze impact of changes to Helm charts.
+        
+        Args:
+            chart_names: List of Helm chart names
+            
+        Returns:
+            Dictionary with Helm chart impact analysis
+        """
+        with self.driver.session() as session:
+            result = session.run("""
+                WITH $chartNames AS charts
+                UNWIND charts AS chartName
+                
+                MATCH (hc:HelmChart)
+                WHERE hc.name = chartName OR hc.path CONTAINS chartName
+                
+                // Find all resources belonging to this chart
+                OPTIONAL MATCH (hc)-[:BELONGS_TO_CHART]->(svc:KubernetesService)
+                WITH hc, collect(DISTINCT svc.name) AS services
+                
+                OPTIONAL MATCH (hc)-[:BELONGS_TO_CHART]->(pod:KubernetesPod)
+                WITH hc, services, collect(DISTINCT pod.name) AS pods
+                
+                OPTIONAL MATCH (hc)-[:BELONGS_TO_CHART]->(ing:KubernetesIngress)
+                WITH hc, services, pods, collect(DISTINCT ing.name) AS ingresses
+                
+                // Find code modules in this chart
+                OPTIONAL MATCH (hc)-[:CONTAINS_CODE]->(cm:CodeModule)
+                WITH hc, services, pods, ingresses, collect(DISTINCT cm.path) AS codeModules
+                
+                // Find services that depend on services in this chart
+                OPTIONAL MATCH (hc)-[:BELONGS_TO_CHART]->(chartSvc:KubernetesService)
+                OPTIONAL MATCH (dependentSvc:KubernetesService)-[:CONNECTS_TO]->(chartSvc)
+                WITH hc, services, pods, ingresses, codeModules,
+                     collect(DISTINCT {
+                         service: dependentSvc.name,
+                         dependsOn: chartSvc.name
+                     }) AS dependentServices
+                
+                // Find code that calls services in this chart
+                OPTIONAL MATCH (hc)-[:BELONGS_TO_CHART]->(chartSvc2:KubernetesService)
+                OPTIONAL MATCH (callerCode:CodeModule)-[:CALLS_SERVICE]->(chartSvc2)
+                WITH hc, services, pods, ingresses, codeModules, dependentServices,
+                     collect(DISTINCT {
+                         codePath: callerCode.path,
+                         callsService: chartSvc2.name
+                     }) AS externalCodeCallers
+                
+                // Find if any services are publicly exposed
+                OPTIONAL MATCH (hc)-[:BELONGS_TO_CHART]->(publicSvc:KubernetesService)
+                     -[:EXPOSED_VIA]->(ing2:KubernetesIngress)
+                
+                RETURN {
+                    chartName: hc.name,
+                    chartPath: hc.path,
+                    chartVersion: hc.version,
+                    services: services,
+                    pods: pods,
+                    ingresses: ingresses,
+                    codeModules: codeModules,
+                    dependentServices: dependentServices,
+                    externalCodeCallers: externalCodeCallers,
+                    isPubliclyExposed: ing2 IS NOT NULL,
+                    publicIngresses: collect(DISTINCT ing2.hosts)
+                } AS impact
+            """, chartNames=chart_names)
+            
+            impacts = []
+            for record in result:
+                impacts.append(record['impact'])
+            
+            return {'chartImpacts': impacts}
+    
+    def analyze_image_changes(self, chart_names: List[str]) -> Dict:
+        """
+        Analyze which pods/deployments will be affected by image changes.
+        
+        Args:
+            chart_names: List of Helm chart names
+            
+        Returns:
+            Dictionary with image change analysis
+        """
+        with self.driver.session() as session:
+            result = session.run("""
+                WITH $chartNames AS charts
+                UNWIND charts AS chartName
+                
+                MATCH (hc:HelmChart)
+                WHERE hc.name = chartName OR hc.path CONTAINS chartName
+                
+                // Find pods and their images
+                MATCH (hc)-[:BELONGS_TO_CHART]->(pod:KubernetesPod)
+                OPTIONAL MATCH (pod)-[:USES_IMAGE]->(img:Image)
+                
+                // Check if image is from ECR
+                OPTIONAL MATCH (img)-[:LINKED_TO]->(ecr:ECRImage)
+                
+                // Find services targeting this pod
+                OPTIONAL MATCH (svc:KubernetesService)-[:TARGETS]->(pod)
+                
+                // Find what depends on these services
+                OPTIONAL MATCH (dependentSvc:KubernetesService)-[:CONNECTS_TO]->(svc)
+                
+                RETURN {
+                    chartName: hc.name,
+                    podName: pod.name,
+                    namespace: pod.namespace,
+                    images: collect(DISTINCT {
+                        image: img.full_name,
+                        repository: img.repository,
+                        tag: img.tag,
+                        isECR: ecr IS NOT NULL,
+                        ecrRepository: ecr.repository
+                    }),
+                    exposedViaServices: collect(DISTINCT svc.name),
+                    dependentServices: collect(DISTINCT dependentSvc.name)
+                } AS imageImpact
+            """, chartNames=chart_names)
+            
+            impacts = []
+            for record in result:
+                impacts.append(record['imageImpact'])
+            
+            return {'imageImpacts': impacts}
+    
+    def analyze_network_policy_impact(self, chart_names: List[str]) -> Dict:
+        """
+        Analyze network policy impacts for changed charts.
+        
+        Args:
+            chart_names: List of Helm chart names
+            
+        Returns:
+            Dictionary with network policy analysis
+        """
+        with self.driver.session() as session:
+            result = session.run("""
+                WITH $chartNames AS charts
+                UNWIND charts AS chartName
+                
+                MATCH (hc:HelmChart)
+                WHERE hc.name = chartName OR hc.path CONTAINS chartName
+                
+                // Find pods in this chart
+                MATCH (hc)-[:BELONGS_TO_CHART]->(pod:KubernetesPod)
+                
+                // Find network policies that apply to these pods
+                OPTIONAL MATCH (np:KubernetesNetworkPolicy)-[:APPLIES_TO]->(pod)
+                
+                // Find other pods affected by same network policies
+                OPTIONAL MATCH (np)-[:APPLIES_TO]->(otherPod:KubernetesPod)
+                WHERE otherPod <> pod
+                
+                RETURN {
+                    chartName: hc.name,
+                    podName: pod.name,
+                    namespace: pod.namespace,
+                    networkPolicies: collect(DISTINCT {
+                        policyName: np.name,
+                        policyNamespace: np.namespace,
+                        ingressRules: np.ingress_rules,
+                        egressRules: np.egress_rules
+                    }),
+                    otherAffectedPods: collect(DISTINCT otherPod.name)
+                } AS networkPolicyImpact
+            """, chartNames=chart_names)
+            
+            impacts = []
+            for record in result:
+                impacts.append(record['networkPolicyImpact'])
+            
+            return {'networkPolicyImpacts': impacts}
+    
+    def analyze_ingress_changes(self, chart_names: List[str]) -> Dict:
+        """
+        Analyze ingress changes and their external impact.
+        
+        Args:
+            chart_names: List of Helm chart names
+            
+        Returns:
+            Dictionary with ingress change analysis
+        """
+        with self.driver.session() as session:
+            result = session.run("""
+                WITH $chartNames AS charts
+                UNWIND charts AS chartName
+                
+                MATCH (hc:HelmChart)
+                WHERE hc.name = chartName OR hc.path CONTAINS chartName
+                
+                // Find ingresses in this chart
+                MATCH (hc)-[:BELONGS_TO_CHART]->(ing:KubernetesIngress)
+                
+                // Find services exposed by these ingresses
+                MATCH (svc:KubernetesService)-[:EXPOSED_VIA]->(ing)
+                
+                // Find pods behind these services
+                OPTIONAL MATCH (svc)-[:TARGETS]->(pod:KubernetesPod)
+                
+                // Check if there's a load balancer
+                OPTIONAL MATCH (svc)-[:USES_LOAD_BALANCER]->(lb:LoadBalancerV2)
+                
+                // Find code that calls this service
+                OPTIONAL MATCH (cm:CodeModule)-[:CALLS_SERVICE]->(svc)
+                
+                RETURN {
+                    chartName: hc.name,
+                    ingressName: ing.name,
+                    namespace: ing.namespace,
+                    hosts: ing.hosts,
+                    paths: ing.paths,
+                    backendServices: collect(DISTINCT {
+                        serviceName: svc.name,
+                        serviceType: svc.type,
+                        pods: collect(DISTINCT pod.name)
+                    }),
+                    loadBalancer: lb.dnsname,
+                    externalCallers: collect(DISTINCT cm.path),
+                    severity: 'CRITICAL'
+                } AS ingressImpact
+            """, chartNames=chart_names)
+            
+            impacts = []
+            for record in result:
+                impacts.append(record['ingressImpact'])
+            
+            return {'ingressImpacts': impacts}

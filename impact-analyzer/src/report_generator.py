@@ -55,15 +55,182 @@ class ReportGenerator:
         md.append("## 📊 Summary")
         md.append("")
         md.append(f"- **Changed Files:** {summary.get('changedFilesCount', 0)}")
+        md.append(f"- **Helm Charts Changed:** {summary.get('helmChartsChangedCount', 0)}")
         md.append(f"- **Affected Services:** {summary.get('affectedServicesCount', 0)}")
         md.append(f"- **Total Impact Radius:** {summary.get('totalImpactCount', 0)} component(s)")
         md.append(f"- **Risk Level:** {self._format_risk_level(summary.get('overallRiskLevel', 'UNKNOWN'))}")
         md.append("")
         
+        # Helm Chart Changes
+        helm_changes = analysis_data.get('helmChanges', [])
+        if helm_changes:
+            md.append("## ⎈ Helm Chart Changes")
+            md.append("")
+            md.append(f"Detected {len(helm_changes)} change(s) in Helm charts:")
+            md.append("")
+            
+            # Group by chart
+            charts_dict = {}
+            for change in helm_changes:
+                chart_name = change['chart_name']
+                if chart_name not in charts_dict:
+                    charts_dict[chart_name] = []
+                charts_dict[chart_name].append(change)
+            
+            for chart_name, changes in charts_dict.items():
+                md.append(f"### Chart: `{chart_name}`")
+                for change in changes:
+                    severity_emoji = self._format_severity(change['severity'])
+                    md.append(f"- **{change['change_type']}** - {severity_emoji}")
+                    md.append(f"  - File: `{change['relative_path']}`")
+                md.append("")
+        
+        # Helm Chart Impacts
+        helm_impacts = analysis_data.get('helmChartImpacts', [])
+        if helm_impacts:
+            md.append("## 📦 Helm Chart Impact Analysis")
+            md.append("")
+            for impact in helm_impacts:
+                chart_name = impact.get('chartName', 'Unknown')
+                md.append(f"### Chart: `{chart_name}`")
+                
+                if impact.get('isPubliclyExposed'):
+                    md.append("⚠️ **Contains Publicly Exposed Services**")
+                    if impact.get('publicIngresses'):
+                        md.append(f"  - Hosts: {impact['publicIngresses']}")
+                
+                services = impact.get('services', [])
+                if services:
+                    md.append(f"- **Services:** {', '.join([f'`{s}`' for s in services])}")
+                
+                pods = impact.get('pods', [])
+                if pods:
+                    md.append(f"- **Pods/Deployments:** {len(pods)}")
+                
+                ingresses = impact.get('ingresses', [])
+                if ingresses:
+                    md.append(f"- **Ingresses:** {', '.join([f'`{i}`' for i in ingresses])}")
+                
+                dependent_services = impact.get('dependentServices', [])
+                if dependent_services:
+                    md.append(f"- **Dependent Services:** {len(dependent_services)}")
+                    for dep in dependent_services[:5]:
+                        if dep and dep.get('service'):
+                            md.append(f"  - `{dep['service']}` depends on `{dep.get('dependsOn', '?')}`")
+                    if len(dependent_services) > 5:
+                        md.append(f"  - ... and {len(dependent_services) - 5} more")
+                
+                external_callers = impact.get('externalCodeCallers', [])
+                if external_callers:
+                    md.append(f"- **External Code Callers:** {len(external_callers)}")
+                    for caller in external_callers[:5]:
+                        if caller and caller.get('codePath'):
+                            md.append(f"  - `{caller['codePath']}` → `{caller.get('callsService', '?')}`")
+                    if len(external_callers) > 5:
+                        md.append(f"  - ... and {len(external_callers) - 5} more")
+                
+                md.append("")
+        
+        # Image Impacts
+        image_impacts = analysis_data.get('imageImpacts', [])
+        if image_impacts:
+            md.append("## 🐳 Container Image Impacts")
+            md.append("")
+            for impact in image_impacts:
+                chart_name = impact.get('chartName', 'Unknown')
+                pod_name = impact.get('podName', 'Unknown')
+                md.append(f"### Pod: `{pod_name}` (Chart: `{chart_name}`)")
+                md.append(f"- **Namespace:** `{impact.get('namespace', 'default')}`")
+                
+                images = impact.get('images', [])
+                if images:
+                    md.append("- **Container Images:**")
+                    for img in images:
+                        if img and img.get('image'):
+                            ecr_marker = " (ECR)" if img.get('isECR') else ""
+                            md.append(f"  - `{img['image']}`{ecr_marker}")
+                
+                exposed_via = impact.get('exposedViaServices', [])
+                if exposed_via:
+                    md.append(f"- **Exposed via Services:** {', '.join([f'`{s}`' for s in exposed_via if s])}")
+                
+                dependent_svcs = impact.get('dependentServices', [])
+                if dependent_svcs:
+                    md.append(f"- **Dependent Services:** {', '.join([f'`{s}`' for s in dependent_svcs if s])}")
+                
+                md.append("")
+        
+        # Ingress Impacts
+        ingress_impacts = analysis_data.get('ingressImpacts', [])
+        if ingress_impacts:
+            md.append("## 🌐 Ingress Changes (External Impact)")
+            md.append("")
+            for impact in ingress_impacts:
+                ingress_name = impact.get('ingressName', 'Unknown')
+                md.append(f"### Ingress: `{ingress_name}` 🔴 CRITICAL")
+                md.append(f"- **Namespace:** `{impact.get('namespace', 'default')}`")
+                
+                hosts = impact.get('hosts')
+                if hosts:
+                    md.append(f"- **Hosts:** {hosts}")
+                
+                paths = impact.get('paths')
+                if paths:
+                    md.append(f"- **Paths:** {paths}")
+                
+                if impact.get('loadBalancer'):
+                    md.append(f"- **Load Balancer:** `{impact['loadBalancer']}`")
+                
+                backend_services = impact.get('backendServices', [])
+                if backend_services:
+                    md.append("- **Backend Services:**")
+                    for svc in backend_services:
+                        if svc and svc.get('serviceName'):
+                            pods = svc.get('pods', [])
+                            pod_info = f" ({len(pods)} pod(s))" if pods else ""
+                            md.append(f"  - `{svc['serviceName']}`{pod_info}")
+                
+                external_callers = impact.get('externalCallers', [])
+                if external_callers:
+                    md.append(f"- **External Callers (in codebase):** {len(external_callers)}")
+                    for caller in external_callers[:3]:
+                        if caller:
+                            md.append(f"  - `{caller}`")
+                
+                md.append("")
+        
+        # Network Policy Impacts
+        network_policy_impacts = analysis_data.get('networkPolicyImpacts', [])
+        if network_policy_impacts:
+            md.append("## 🔒 Network Policy Impacts")
+            md.append("")
+            for impact in network_policy_impacts:
+                pod_name = impact.get('podName', 'Unknown')
+                md.append(f"### Pod: `{pod_name}`")
+                md.append(f"- **Namespace:** `{impact.get('namespace', 'default')}`")
+                
+                policies = impact.get('networkPolicies', [])
+                if policies:
+                    md.append(f"- **Network Policies Applied:** {len(policies)}")
+                    for policy in policies:
+                        if policy and policy.get('policyName'):
+                            md.append(f"  - `{policy['policyName']}`")
+                
+                other_pods = impact.get('otherAffectedPods', [])
+                if other_pods:
+                    md.append(f"- **Other Pods Affected by Same Policies:** {len(other_pods)}")
+                    for pod in other_pods[:5]:
+                        if pod:
+                            md.append(f"  - `{pod}`")
+                    if len(other_pods) > 5:
+                        md.append(f"  - ... and {len(other_pods) - 5} more")
+                
+                md.append("")
+        
         # Changed Components
         components = analysis_data.get('changedComponents', [])
         if components:
-            md.append("## 📝 Changed Components")
+            md.append("## 📝 Changed Code Components")
             md.append("")
             for comp in components:
                 md.append(f"### `{comp.get('codeFile', 'Unknown')}`")
@@ -219,10 +386,21 @@ class ReportGenerator:
         impacts = analysis_data.get('blastRadius', [])
         risks = analysis_data.get('riskAnalysis', [])
         breaking = analysis_data.get('breakingChanges', [])
+        helm_changes = analysis_data.get('helmChanges', [])
+        ingress_impacts = analysis_data.get('ingressImpacts', [])
         
         # Calculate overall risk
         risk_scores = [r.get('riskScore', 0) for r in risks]
         max_risk = max(risk_scores) if risk_scores else 0
+        
+        # Increase risk if ingresses are affected
+        if ingress_impacts:
+            max_risk = max(max_risk, 250)
+        
+        # Increase risk for critical Helm changes
+        critical_helm_changes = [h for h in helm_changes if h.get('severity') == 'CRITICAL']
+        if critical_helm_changes:
+            max_risk = max(max_risk, 200)
         
         if max_risk > 200:
             overall_risk = 'CRITICAL'
@@ -241,8 +419,12 @@ class ReportGenerator:
             for i in impacts
         )
         
+        # Get unique chart names
+        helm_charts_changed = len(set(h.get('chart_name') for h in helm_changes if h.get('chart_name')))
+        
         return {
             'changedFilesCount': len(analysis_data.get('changedComponents', [])),
+            'helmChartsChangedCount': helm_charts_changed,
             'affectedServicesCount': len(impacts),
             'totalImpactCount': total_impact,
             'breakingChangesCount': len(breaking),

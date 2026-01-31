@@ -64,7 +64,7 @@ class ImpactAnalyzer:
         logger.info("=" * 80)
         
         # Step 1: Detect changed files
-        logger.info("\n[Step 1/6] Detecting changed files...")
+        logger.info("\n[Step 1/9] Detecting changed files...")
         changes = self.change_detector.get_changed_files(
             base_ref=base_ref,
             head_ref=head_ref,
@@ -82,13 +82,21 @@ class ImpactAnalyzer:
             logger.warning("No changed files detected")
             return self._empty_analysis()
         
-        # Step 2: Identify affected services
-        logger.info("\n[Step 2/6] Identifying affected services...")
+        # Step 2: Detect Helm chart changes
+        logger.info("\n[Step 2/9] Detecting Helm chart changes...")
+        helm_changes = self.change_detector.detect_helm_changes(all_changed_files)
+        logger.info(f"Detected {len(helm_changes)} Helm chart change(s)")
+        
+        # Extract chart names
+        changed_chart_names = list(set(hc['chart_name'] for hc in helm_changes))
+        
+        # Step 3: Identify affected services
+        logger.info("\n[Step 3/9] Identifying affected services...")
         affected_services = self.change_detector.identify_affected_services(all_changed_files)
         logger.info(f"Identified {len(affected_services)} affected service(s): {', '.join(affected_services)}")
         
-        # Step 3: Find affected components in graph
-        logger.info("\n[Step 3/6] Querying graph for affected components...")
+        # Step 4: Find affected components in graph
+        logger.info("\n[Step 4/9] Querying graph for affected components...")
         components_result = self.graph_analyzer.find_affected_components(all_changed_files)
         changed_components = components_result['components']
         logger.info(f"Found {len(changed_components)} component(s) in graph")
@@ -103,22 +111,73 @@ class ImpactAnalyzer:
         service_names.extend(affected_services)
         service_names = list(set(service_names))  # Deduplicate
         
-        if not service_names:
-            logger.warning("No services found in graph for changed files")
+        # Step 5: Analyze Helm chart impacts
+        helm_chart_impacts = []
+        image_impacts = []
+        network_policy_impacts = []
+        ingress_impacts = []
+        
+        if changed_chart_names:
+            logger.info(f"\n[Step 5/9] Analyzing Helm chart impacts for {len(changed_chart_names)} chart(s)...")
+            
+            # Get comprehensive Helm chart impact
+            chart_impact_result = self.graph_analyzer.analyze_helm_chart_impact(changed_chart_names)
+            helm_chart_impacts = chart_impact_result['chartImpacts']
+            logger.info(f"  - Analyzed {len(helm_chart_impacts)} chart impact(s)")
+            
+            # Analyze image changes
+            image_impact_result = self.graph_analyzer.analyze_image_changes(changed_chart_names)
+            image_impacts = image_impact_result['imageImpacts']
+            logger.info(f"  - Analyzed {len(image_impacts)} image impact(s)")
+            
+            # Analyze network policy impacts
+            network_policy_result = self.graph_analyzer.analyze_network_policy_impact(changed_chart_names)
+            network_policy_impacts = network_policy_result['networkPolicyImpacts']
+            logger.info(f"  - Analyzed {len(network_policy_impacts)} network policy impact(s)")
+            
+            # Analyze ingress changes
+            ingress_impact_result = self.graph_analyzer.analyze_ingress_changes(changed_chart_names)
+            ingress_impacts = ingress_impact_result['ingressImpacts']
+            logger.info(f"  - Analyzed {len(ingress_impacts)} ingress impact(s)")
+            
+            # Extract services from Helm chart impacts
+            for chart_impact in helm_chart_impacts:
+                service_names.extend(chart_impact.get('services', []))
+            service_names = list(set(service_names))  # Deduplicate
+        else:
+            logger.info("\n[Step 5/9] No Helm chart changes detected, skipping Helm-specific analysis")
+        
+        if not service_names and not helm_chart_impacts:
+            logger.warning("No services or charts found for analysis")
             return self._empty_analysis()
         
-        logger.info(f"Analyzing impact for services: {', '.join(service_names)}")
+        logger.info(f"Analyzing impact for {len(service_names)} total service(s): {', '.join(service_names)}")
         
-        # Step 4: Calculate blast radius
-        logger.info("\n[Step 4/6] Calculating blast radius...")
-        blast_radius_result = self.graph_analyzer.calculate_blast_radius(service_names)
-        blast_radius = blast_radius_result['impacts']
-        logger.info(f"Calculated blast radius for {len(blast_radius)} service(s)")
+        # Step 6: Calculate blast radius
+        blast_radius = []
+        if service_names:
+            logger.info("\n[Step 6/9] Calculating blast radius...")
+            blast_radius_result = self.graph_analyzer.calculate_blast_radius(service_names)
+            blast_radius = blast_radius_result['impacts']
+            logger.info(f"Calculated blast radius for {len(blast_radius)} service(s)")
+        else:
+            logger.info("\n[Step 6/9] Skipping blast radius calculation (no services)")
         
-        # Step 5: Detect breaking changes
-        logger.info("\n[Step 5/6] Detecting potential breaking changes...")
+        # Step 7: Detect breaking changes
+        logger.info("\n[Step 7/9] Detecting potential breaking changes...")
         breaking_changes = self.change_detector.detect_breaking_changes(changes['modified'])
         logger.info(f"Detected {len(breaking_changes)} potential breaking change(s)")
+        
+        # Add Helm changes to breaking changes
+        for helm_change in helm_changes:
+            if helm_change['severity'] in ['HIGH', 'CRITICAL']:
+                breaking_changes.append({
+                    'file': helm_change['changed_file'],
+                    'type': f"HELM_{helm_change['change_type']}",
+                    'chart': helm_change['chart_name'],
+                    'severity': helm_change['severity'],
+                    'message': f"Helm chart change: {helm_change['change_type']} in {helm_change['relative_path']}"
+                })
         
         # Check breaking impacts for API changes
         breaking_impacts = []
@@ -136,14 +195,21 @@ class ImpactAnalyzer:
         
         logger.info(f"Found {len(breaking_impacts)} breaking impact(s)")
         
-        # Step 6: Calculate risk and recommendations
-        logger.info("\n[Step 6/6] Calculating risk scores and recommendations...")
-        risk_result = self.graph_analyzer.calculate_risk_score(service_names)
-        risks = risk_result['risks']
+        # Step 8: Calculate risk and recommendations
+        risks = []
+        recommendations = []
         
-        recommendations_result = self.graph_analyzer.get_deployment_recommendations(service_names)
-        recommendations = recommendations_result['recommendations']
+        if service_names:
+            logger.info("\n[Step 8/9] Calculating risk scores and recommendations...")
+            risk_result = self.graph_analyzer.calculate_risk_score(service_names)
+            risks = risk_result['risks']
+            
+            recommendations_result = self.graph_analyzer.get_deployment_recommendations(service_names)
+            recommendations = recommendations_result['recommendations']
+        else:
+            logger.info("\n[Step 8/9] Skipping risk calculation (no services)")
         
+        logger.info("\n[Step 9/9] Compiling results...")
         logger.info("Analysis complete!")
         
         # Compile results
@@ -151,6 +217,11 @@ class ImpactAnalyzer:
             'changedFiles': all_changed_files,
             'changedComponents': changed_components,
             'affectedServices': service_names,
+            'helmChanges': helm_changes,
+            'helmChartImpacts': helm_chart_impacts,
+            'imageImpacts': image_impacts,
+            'networkPolicyImpacts': network_policy_impacts,
+            'ingressImpacts': ingress_impacts,
             'blastRadius': blast_radius,
             'breakingChanges': breaking_changes,
             'breakingImpacts': breaking_impacts,
@@ -193,6 +264,11 @@ class ImpactAnalyzer:
             'changedFiles': [],
             'changedComponents': [],
             'affectedServices': [],
+            'helmChanges': [],
+            'helmChartImpacts': [],
+            'imageImpacts': [],
+            'networkPolicyImpacts': [],
+            'ingressImpacts': [],
             'blastRadius': [],
             'breakingChanges': [],
             'breakingImpacts': [],
@@ -201,6 +277,7 @@ class ImpactAnalyzer:
             'summary': {
                 'changedFilesCount': 0,
                 'affectedServicesCount': 0,
+                'helmChartsChangedCount': 0,
                 'totalImpactCount': 0,
                 'breakingChangesCount': 0,
                 'overallRiskLevel': 'LOW',
