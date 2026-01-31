@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""
+Impact Analyzer - Executable wrapper
+"""
+
+import sys
+import os
+from pathlib import Path
+
+# Add src directory to path
+script_dir = Path(__file__).parent.resolve()
+src_dir = script_dir / 'src'
+sys.path.insert(0, str(src_dir))
+
+# Now import and run
+if __name__ == '__main__':
+    import argparse
+    from pathlib import Path
+    from impact_analyzer import ImpactAnalyzer
+    
+    parser = argparse.ArgumentParser(
+        description="Analyze the impact of code changes on infrastructure",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Analyze changes between branches
+  impact-analyzer --base-ref origin/main --head-ref HEAD
+  
+  # Analyze specific files
+  impact-analyzer --files services/user-service/src/index.js services/api-gateway/src/routes.js
+  
+  # Generate JSON report
+  impact-analyzer --format json --output report.json
+
+Environment Variables:
+  NEO4J_URI       - Neo4j connection URI (required)
+  NEO4J_USER      - Neo4j username (default: neo4j)
+  NEO4J_PASSWORD  - Neo4j password (required)
+        """
+    )
+    
+    # Git comparison
+    parser.add_argument(
+        '--base-ref',
+        default='origin/main',
+        help='Base git ref for comparison (default: origin/main)'
+    )
+    parser.add_argument(
+        '--head-ref',
+        default='HEAD',
+        help='Head git ref for comparison (default: HEAD)'
+    )
+    parser.add_argument(
+        '--files',
+        nargs='+',
+        help='Specific files to analyze (overrides git diff)'
+    )
+    
+    # Repository
+    parser.add_argument(
+        '--repo-path',
+        default='.',
+        help='Path to git repository (default: current directory)'
+    )
+    
+    # Neo4j connection
+    parser.add_argument(
+        '--neo4j-uri',
+        default=os.getenv('NEO4J_URI'),
+        help='Neo4j connection URI (or set NEO4J_URI env var)'
+    )
+    parser.add_argument(
+        '--neo4j-user',
+        default=os.getenv('NEO4J_USER', 'neo4j'),
+        help='Neo4j username (or set NEO4J_USER env var)'
+    )
+    parser.add_argument(
+        '--neo4j-password',
+        default=os.getenv('NEO4J_PASSWORD'),
+        help='Neo4j password (or set NEO4J_PASSWORD env var)'
+    )
+    
+    # Output
+    parser.add_argument(
+        '--format',
+        choices=['markdown', 'json'],
+        default='markdown',
+        help='Output format (default: markdown)'
+    )
+    parser.add_argument(
+        '--output',
+        '-o',
+        help='Output file (default: stdout)'
+    )
+    parser.add_argument(
+        '--verbose',
+        '-v',
+        action='store_true',
+        help='Verbose logging'
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate Neo4j connection
+    if not args.neo4j_uri:
+        print("Error: Neo4j URI is required. Set --neo4j-uri or NEO4J_URI environment variable.", file=sys.stderr)
+        sys.exit(1)
+    
+    if not args.neo4j_password:
+        print("Error: Neo4j password is required. Set --neo4j-password or NEO4J_PASSWORD environment variable.", file=sys.stderr)
+        sys.exit(1)
+    
+    # Configure logging
+    if not args.verbose:
+        import logging
+        logging.basicConfig(level=logging.WARNING)
+    
+    try:
+        # Initialize analyzer
+        analyzer = ImpactAnalyzer(
+            neo4j_uri=args.neo4j_uri,
+            neo4j_user=args.neo4j_user,
+            neo4j_password=args.neo4j_password,
+            repo_path=args.repo_path
+        )
+        
+        # Run analysis
+        analysis_data = analyzer.analyze(
+            base_ref=args.base_ref,
+            head_ref=args.head_ref,
+            changed_files=args.files
+        )
+        
+        # Generate report
+        report = analyzer.generate_report(analysis_data, format=args.format)
+        
+        # Output report
+        if args.output:
+            output_path = Path(args.output)
+            output_path.write_text(report)
+            print(f"Report written to: {output_path}", file=sys.stderr)
+        else:
+            print(report)
+        
+        # Close connections
+        analyzer.close()
+        
+        # Exit with appropriate code based on risk level
+        risk_level = analysis_data.get('summary', {}).get('overallRiskLevel', 'LOW')
+        if risk_level == 'CRITICAL':
+            sys.exit(2)  # High risk detected
+        elif len(analysis_data.get('breakingChanges', [])) > 0:
+            sys.exit(1)  # Breaking changes detected
+        else:
+            sys.exit(0)  # All clear
+        
+    except KeyboardInterrupt:
+        print("\nAnalysis interrupted by user", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
