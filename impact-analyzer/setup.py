@@ -23,6 +23,7 @@ setup(
     package_dir={'': 'src'},
     install_requires=[
         'neo4j>=5.14.0',
+        'pyyaml>=6.0',
     ],
     entry_points={
         'console_scripts': [
